@@ -1,0 +1,5 @@
+# Бот и агент (Airflow ставит свои зависимости сам, в образе apache/airflow)
+aiogram>=3.13,<4
+anthropic>=2.3,<3
+asyncpg>=0.29,<1
+python-dotenv>=1.0
