@@ -18,6 +18,9 @@ class Config:
     default_city: str
     visit_fee: Decimal
     currency: str
+    # версия сценария общения с мастерами: записывается в каждого нового лида,
+    # чтобы сравнивать конверсию до и после изменений
+    script_version: str
 
     @property
     def agent_enabled(self) -> bool:
@@ -63,4 +66,5 @@ def load_config(require_token: bool = True) -> Config:
         default_city=os.getenv("DEFAULT_CITY", "Yerevan").strip(),
         visit_fee=visit_fee,
         currency=os.getenv("CURRENCY", "AMD").strip(),
+        script_version=os.getenv("SCRIPT_VERSION", "v1").strip() or "v1",
     )

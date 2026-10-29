@@ -24,5 +24,5 @@ async def create_agent(config: Config, db: Database) -> ManagerAgent | None:
             dwh = await asyncpg.create_pool(config.agent_dwh_url, min_size=1, max_size=3)
         except (OSError, asyncpg.PostgresError):
             log.warning("Нет подключения к DWH: агент будет работать только с базой бота", exc_info=True)
-    tools = AgentTools(db, operational, dwh)
+    tools = AgentTools(db, operational, dwh, script_version=config.script_version)
     return ManagerAgent(tools, model=config.agent_model, effort=config.agent_effort)

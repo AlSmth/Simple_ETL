@@ -4,6 +4,8 @@ from decimal import Decimal
 
 import asyncpg
 
+from .leads import Leads
+
 # Полная карточка заявки: всё, что нужно для сообщений мастерам, менеджерам и заказчику
 ORDER_CARD_SQL = """
     SELECT o.*, c.code AS category_code,
@@ -20,9 +22,11 @@ class Database:
     def __init__(self, dsn: str):
         self.dsn = dsn
         self.pool: asyncpg.Pool | None = None
+        self.leads: Leads | None = None
 
     async def connect(self) -> None:
         self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
+        self.leads = Leads(self.pool)
 
     async def close(self) -> None:
         if self.pool:
@@ -48,6 +52,10 @@ class Database:
             """,
             user_id, full_name, username, lang,
         )
+
+    async def set_customer_consent(self, customer_id: int, consent: bool) -> None:
+        await self.pool.execute("UPDATE customers SET contact_consent = $2 WHERE customer_id = $1",
+                                customer_id, consent)
 
     async def mark_blocked(self, customer_id: int) -> None:
         await self.pool.execute(
@@ -175,23 +183,6 @@ class Database:
         row = await self.pool.fetchrow("SELECT * FROM masters WHERE master_id = $1", user_id)
         return dict(row) if row else None
 
-    async def request_master(self, user_id: int, full_name: str, username: str | None) -> None:
-        """Заявка в мастера: запись появляется неактивной, активирует её менеджер."""
-        await self.pool.execute(
-            """
-            INSERT INTO masters (master_id, full_name, username, is_active) VALUES ($1, $2, $3, FALSE)
-            ON CONFLICT (master_id) DO UPDATE SET
-                full_name = EXCLUDED.full_name, username = EXCLUDED.username
-            """,
-            user_id, full_name, username,
-        )
-
-    async def set_master_active(self, user_id: int, active: bool) -> dict | None:
-        row = await self.pool.fetchrow(
-            "UPDATE masters SET is_active = $2 WHERE master_id = $1 RETURNING *", user_id, active
-        )
-        return dict(row) if row else None
-
     async def active_master_ids(self) -> list[int]:
         rows = await self.pool.fetch("SELECT master_id FROM masters WHERE is_active")
         return [r["master_id"] for r in rows]
@@ -209,14 +200,14 @@ class Database:
             broadcast_id, customer_id, order_id, source, text, status, error,
         )
 
-    async def create_broadcast(self, created_by: int, text: str, customer_ids: list[int],
-                               order_id: int | None) -> int:
+    async def create_broadcast(self, created_by: int, audience: str, text: str,
+                               recipient_ids: list[int], order_id: int | None) -> int:
         return await self.pool.fetchval(
             """
-            INSERT INTO broadcasts (created_by, text, customer_ids, order_id)
-            VALUES ($1, $2, $3, $4) RETURNING broadcast_id
+            INSERT INTO broadcasts (created_by, audience, text, recipient_ids, order_id)
+            VALUES ($1, $2, $3, $4, $5) RETURNING broadcast_id
             """,
-            created_by, text, customer_ids, order_id,
+            created_by, audience, text, recipient_ids, order_id,
         )
 
     async def get_broadcast(self, broadcast_id: int) -> dict | None:
@@ -238,7 +229,7 @@ class Database:
 
     async def customers_by_ids(self, customer_ids: list[int]) -> list[dict]:
         rows = await self.pool.fetch(
-            "SELECT customer_id, contact_name, lang, is_blocked FROM customers "
+            "SELECT customer_id, contact_name, lang, is_blocked, contact_consent FROM customers "
             "WHERE customer_id = ANY($1::bigint[])",
             customer_ids,
         )

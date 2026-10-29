@@ -1,4 +1,4 @@
-"""Мастера: регистрация через одобрение менеджера, свободные заявки, взятие, закрытие."""
+"""Подключённые мастера: свободные заявки, взятие, закрытие. Подключение — в onboarding.py."""
 
 import logging
 from decimal import Decimal, InvalidOperation
@@ -20,14 +20,6 @@ from .customer import announce_order
 log = logging.getLogger(__name__)
 router = Router(name="master")
 
-MASTER_HELP = (
-    "👷 Вы в команде мастеров.\n\n"
-    "/new — свободные заявки\n"
-    "/my — мои заявки в работе\n\n"
-    "Новые заявки будут приходить сюда автоматически."
-)
-
-
 class CompleteForm(StatesGroup):
     service = State()
     price = State()
@@ -44,27 +36,6 @@ def assigned_markup(order: dict) -> InlineKeyboardMarkup:
     if buttons:
         markup.inline_keyboard.insert(0, buttons)
     return markup
-
-
-# ---------- регистрация ----------
-
-@router.message(Command("master"))
-async def cmd_master(message: Message, state: FSMContext, db: Database, bot: Bot, config: Config):
-    await state.clear()
-    master = await db.get_master(message.from_user.id)
-    if master and master["is_active"]:
-        await message.answer(MASTER_HELP)
-        return
-    user = message.from_user
-    await db.request_master(user.id, user.full_name, user.username)
-    username = f" (@{esc(user.username)})" if user.username else ""
-    await notify_managers(
-        bot, config,
-        f"🙋 <b>Заявка в мастера</b>\n"
-        f'<a href="tg://user?id={user.id}">{esc(user.full_name)}</a>{username}, id <code>{user.id}</code>',
-        markup=kb.master_request_kb(user.id),
-    )
-    await message.answer("Заявка отправлена менеджеру. Как только её одобрят, я напишу.")
 
 
 # ---------- свободные заявки и взятие ----------
@@ -107,7 +78,7 @@ async def take_not_master(callback: CallbackQuery):
 
 @router.message(Command("new", "my"))
 async def master_only(message: Message):
-    await message.answer("Эти команды — для мастеров. Подать заявку в команду: /master")
+    await message.answer("Эти команды — для подключённых мастеров. Подключиться: /master")
 
 
 # ---------- мои заявки ----------

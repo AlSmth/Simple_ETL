@@ -7,6 +7,8 @@ from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from psycopg2.extras import execute_values
 
+from etl_common import default_args
+
 # Перекрытие окна загрузки: строка, закоммиченная чуть позже, чем проставлен её updated_at,
 # не потеряется. Повторно прочитанные строки безопасны — запись идёт через upsert.
 HWM_LOOKBACK = timedelta(minutes=10)
@@ -33,6 +35,21 @@ class Table:
 
 
 TABLES = [
+    # CRM: мастера — основные клиенты
+    Table("leads", "dim_leads",
+          ("lead_id", "full_name", "lang", "source", "categories", "districts", "status",
+           "refusal_reason", "contact_consent", "script_version", "last_contact_at",
+           "next_contact_at", "follow_up_reason", "auto_reminders", "registration_done_at",
+           "connected_at", "first_payment_at", "created_at", "updated_at"),
+          ("lead_id",)),
+    Table("lead_events", "fact_lead_events",
+          ("event_id", "lead_id", "event_type", "from_status", "to_status", "created_by", "via",
+           "created_at", "updated_at"),
+          ("event_id",)),
+    Table("masters", "dim_masters",
+          ("master_id", "lead_id", "full_name", "is_active", "created_at", "updated_at"),
+          ("master_id",)),
+    # заявки заказчиков — то, ради чего мастера подключаются
     Table("categories", "dim_categories",
           ("category_id", "code", "category_name", "updated_at"),
           ("category_id",)),
@@ -43,9 +60,6 @@ TABLES = [
           ("customer_id", "contact_name", "lang", "city", "district", "is_blocked",
            "created_at", "updated_at"),
           ("customer_id",)),
-    Table("masters", "dim_masters",
-          ("master_id", "full_name", "is_active", "created_at", "updated_at"),
-          ("master_id",)),
     Table("orders", "fact_orders",
           ("order_id", "customer_id", "master_id", "category_id", "city", "district",
            "contact_method", "status", "order_date", "assigned_at", "completed_at",
@@ -60,46 +74,77 @@ TABLES = [
           ("message_id",)),
 ]
 
+# Этапы воронки по порядку; отказ — отдельный исход, этапом не считается
+STAGES = "ARRAY['new', 'contacted', 'negotiation', 'registration', 'connected']"
 
-# ---------- журнал запусков ----------
+CRM_MARTS_SQL = f"""
+TRUNCATE dwh_mart_lead_funnel;
+WITH reached AS (
+    SELECT l.lead_id, l.source, l.script_version, l.status, l.first_payment_at,
+           l.days_to_connect, date_trunc('month', l.created_at)::date AS cohort_month,
+           -- самый дальний этап, до которого лид дошёл: по текущему статусу и по истории
+           GREATEST(
+               COALESCE(array_position({STAGES}, l.status), 1),
+               COALESCE((SELECT max(array_position({STAGES}, e.to_status))
+                         FROM dwh_fact_lead_events e WHERE e.lead_id = l.lead_id), 1)
+           ) AS stage
+    FROM dwh_dim_leads l
+)
+INSERT INTO dwh_mart_lead_funnel
+SELECT cohort_month, source, script_version,
+       count(*),
+       count(*) FILTER (WHERE stage >= 2),
+       count(*) FILTER (WHERE stage >= 3),
+       count(*) FILTER (WHERE stage >= 5),
+       count(*) FILTER (WHERE first_payment_at IS NOT NULL),
+       count(*) FILTER (WHERE status = 'refused'),
+       round(count(*) FILTER (WHERE stage >= 5)::numeric / count(*), 4),
+       round(count(*) FILTER (WHERE first_payment_at IS NOT NULL)::numeric
+             / NULLIF(count(*) FILTER (WHERE stage >= 3), 0), 4),
+       round(count(*) FILTER (WHERE status = 'refused')::numeric / count(*), 4),
+       round(avg(days_to_connect), 2)
+FROM reached
+GROUP BY cohort_month, source, script_version;
 
-def log_to_db(dag_id, task_id, status, start_time, end_time, error_message=None):
-    hook = PostgresHook(postgres_conn_id='postgres_dwh')
-    duration = int((end_time - start_time).total_seconds())
+TRUNCATE dwh_mart_refusals;
+INSERT INTO dwh_mart_refusals
+SELECT COALESCE(l.refusal_reason, 'unknown'), d.district, l.source, count(*)
+FROM dwh_dim_leads l
+CROSS JOIN LATERAL unnest(CASE WHEN cardinality(l.districts) > 0 THEN l.districts
+                               ELSE ARRAY['unknown'] END) AS d(district)
+WHERE l.status = 'refused'
+GROUP BY 1, 2, 3;
 
-    hook.run("""
-        INSERT INTO etl_logs (
-            dag_id, task_id, status, start_time, end_time, duration_seconds, error_message
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-    """, parameters=(
-        dag_id, task_id, status, start_time, end_time, duration, error_message
-    ))
+TRUNCATE dwh_mart_district_balance;
+WITH lead_districts AS (
+    SELECT d.district, l.status, l.refusal_reason
+    FROM dwh_dim_leads l CROSS JOIN LATERAL unnest(l.districts) AS d(district)
+), orders AS (
+    SELECT district, count(*) AS orders_30d
+    FROM dwh_fact_orders
+    WHERE order_date >= now() - interval '30 days' AND district IS NOT NULL
+    GROUP BY district
+), districts AS (
+    SELECT district FROM lead_districts UNION SELECT district FROM orders
+)
+INSERT INTO dwh_mart_district_balance
+SELECT d.district,
+       count(ld.status) FILTER (WHERE ld.status = 'connected'),
+       count(ld.status) FILTER (WHERE ld.status NOT IN ('connected', 'refused')),
+       count(ld.status) FILTER (WHERE ld.status = 'refused' AND ld.refusal_reason = 'few_orders'),
+       COALESCE(max(o.orders_30d), 0),
+       round(COALESCE(max(o.orders_30d), 0)::numeric
+             / NULLIF(count(ld.status) FILTER (WHERE ld.status = 'connected'), 0), 2)
+FROM districts d
+LEFT JOIN lead_districts ld USING (district)
+LEFT JOIN orders o USING (district)
+GROUP BY d.district;
 
-
-def _log_task(context, status, error_message=None):
-    try:
-        ti = context['task_instance']
-        start_time = ti.start_date.replace(tzinfo=None) if ti.start_date else datetime.utcnow()
-        log_to_db(
-            dag_id=ti.dag_id,
-            task_id=ti.task_id,
-            status=status,
-            start_time=start_time,
-            end_time=datetime.utcnow(),
-            error_message=error_message,
-        )
-    except Exception as e:
-        # падение логирования не должно ронять сам пайплайн
-        print(f"ERROR IN {status} CALLBACK: {e}")
-
-
-def on_success(context):
-    _log_task(context, 'SUCCESS')
-
-
-def on_failure(context):
-    _log_task(context, 'FAILED', str(context.get('exception')))
+-- снимок за сегодня пересчитывается, прошлые дни остаются как есть
+DELETE FROM dwh_mart_lead_status_daily WHERE snapshot_date = current_date;
+INSERT INTO dwh_mart_lead_status_daily
+SELECT current_date, status, count(*) FROM dwh_dim_leads GROUP BY status;
+"""
 
 
 # ---------- High Water Mark ----------
@@ -184,17 +229,20 @@ def stg_to_dwh():
     copy_layer('postgres_stg', 'postgres_dwh', [(t.stg, t.dwh, t.columns) for t in TABLES])
 
 
-default_args = {
-    'on_success_callback': on_success,
-    'on_failure_callback': on_failure,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
-}
+def build_crm_marts():
+    """Витрины CRM внутри DWH: воронка, отказы, баланс районов, снимок статусов."""
+    dwh = PostgresHook(postgres_conn_id='postgres_dwh')
+    with closing(dwh.get_conn()) as conn, conn, conn.cursor() as cur:
+        cur.execute(CRM_MARTS_SQL)
+        for mart in ("dwh_mart_lead_funnel", "dwh_mart_refusals", "dwh_mart_district_balance"):
+            cur.execute(f"SELECT count(*) FROM {mart}")
+            print(f"{mart}: {cur.fetchone()[0]} rows")
+
 
 with DAG(
     'handyman_etl',
     default_args=default_args,
-    description='Заявки Telegram-бота: база бота -> MRR -> STG -> DWH',
+    description='База бота -> MRR -> STG -> DWH и витрины CRM',
     start_date=datetime(2026, 3, 23),
     schedule='@daily',
     catchup=False,
@@ -211,5 +259,6 @@ with DAG(
 
     t_stg = PythonOperator(task_id='mrr_to_stg', python_callable=mrr_to_stg)
     t_dwh = PythonOperator(task_id='stg_to_dwh', python_callable=stg_to_dwh)
+    t_marts = PythonOperator(task_id='build_crm_marts', python_callable=build_crm_marts)
 
-    load_tasks >> t_stg >> t_dwh
+    load_tasks >> t_stg >> t_dwh >> t_marts

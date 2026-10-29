@@ -1,4 +1,5 @@
-"""Менеджер: одобряет мастеров, переписывается с AI-агентом и подтверждает его рассылки."""
+"""Менеджер: переписывается с AI-агентом и подтверждает его рассылки.
+CRM-кнопки и команды /leads, /tasks — в crm.py."""
 
 import asyncio
 import contextlib
@@ -10,12 +11,10 @@ from aiogram.filters import Command, StateFilter
 from aiogram.types import CallbackQuery, Message
 
 from ..agent import ManagerAgent
-from ..config import Config
 from ..db import Database
 from ..notify import run_broadcast
 from . import keyboards as kb
 from .common import IsManager, esc
-from .master import MASTER_HELP
 
 log = logging.getLogger(__name__)
 router = Router(name="manager")
@@ -24,43 +23,21 @@ router.callback_query.filter(IsManager())
 
 TELEGRAM_LIMIT = 4000
 LANG_NAMES = {"ru": "русский", "en": "английский", "hy": "армянский"}
+AUDIENCE_NAMES = {"customers": "заказчикам", "leads": "мастерам"}
 
 MANAGER_HELP = (
-    "Вы менеджер. Пишите агенту обычным текстом, например:\n"
-    "• сколько заявок за эту неделю и сколько из них ещё без мастера?\n"
-    "• какая выручка по категориям за октябрь?\n"
-    "• напиши заказчикам с открытыми заявками по сантехнике, что мастер приедет завтра до 12\n\n"
+    "Вы менеджер. Мастера — наши основные клиенты, и бот ведёт их воронку:\n"
+    "/leads — воронка мастеров\n"
+    "/tasks — кому пора написать сегодня (задачи приходят и сами в 10:00)\n"
+    "/lead 12 — карточка лида\n\n"
+    "Всё остальное пишите агенту обычным текстом, например:\n"
+    "• кто из мастеров отказался из-за цены и в каких районах?\n"
+    "• добавь мастера Ашот, сантехник, Арабкир, +374 91 123456, позвонить завтра\n"
+    "• напомни мастерам, которые не закончили регистрацию\n"
+    "• какая конверсия в подключение за октябрь?\n\n"
     "Рассылки агент только готовит — отправляете вы кнопкой.\n"
     "/reset — начать с агентом новый диалог"
 )
-
-
-# ---------- мастера ----------
-
-@router.callback_query(F.data.startswith("mapprove:"))
-async def approve_master(callback: CallbackQuery, db: Database, bot: Bot):
-    user_id = int(callback.data.split(":", 1)[1])
-    if await db.set_master_active(user_id, True) is None:
-        await callback.answer("Заявка в мастера не найдена", show_alert=True)
-        return
-    await callback.answer("Мастер добавлен")
-    await callback.message.edit_text(
-        f"{callback.message.html_text}\n\n✅ Принят: {esc(callback.from_user.full_name)}"
-    )
-    with contextlib.suppress(Exception):
-        await bot.send_message(user_id, "✅ Вас добавили в команду мастеров!\n\n" + MASTER_HELP)
-
-
-@router.callback_query(F.data.startswith("mreject:"))
-async def reject_master(callback: CallbackQuery, db: Database, bot: Bot):
-    user_id = int(callback.data.split(":", 1)[1])
-    await db.set_master_active(user_id, False)
-    await callback.answer("Отклонено")
-    await callback.message.edit_text(
-        f"{callback.message.html_text}\n\n❌ Отклонён: {esc(callback.from_user.full_name)}"
-    )
-    with contextlib.suppress(Exception):
-        await bot.send_message(user_id, "К сожалению, заявку в мастера отклонили.")
 
 
 # ---------- рассылки агента ----------
@@ -95,15 +72,20 @@ async def cancel_broadcast(callback: CallbackQuery, db: Database, agent: Manager
 
 async def show_broadcast(message: Message, db: Database, broadcast_id: int) -> None:
     broadcast = await db.get_broadcast(broadcast_id)
-    customers = await db.customers_by_ids(broadcast["customer_ids"])
-    langs = sorted({LANG_NAMES.get(c["lang"], c["lang"]) for c in customers})
-    names = ", ".join(esc(c["contact_name"]) for c in customers[:10])
-    if len(customers) > 10:
-        names += f" и ещё {len(customers) - 10}"
+    if broadcast["audience"] == "leads":
+        recipients = await db.leads.by_ids(broadcast["recipient_ids"])
+        names = [r["full_name"] for r in recipients]
+    else:
+        recipients = await db.customers_by_ids(broadcast["recipient_ids"])
+        names = [r["contact_name"] for r in recipients]
+    langs = sorted({LANG_NAMES.get(r["lang"], r["lang"]) for r in recipients})
+    shown = ", ".join(esc(n) for n in names[:10])
+    if len(names) > 10:
+        shown += f" и ещё {len(names) - 10}"
     order = f" по заявке №{broadcast['order_id']}" if broadcast["order_id"] else ""
     await message.answer(
-        f"📨 <b>Рассылка №{broadcast_id}{order}</b>\n"
-        f"Получателей: {len(customers)} ({names})\n"
+        f"📨 <b>Рассылка №{broadcast_id} {AUDIENCE_NAMES[broadcast['audience']]}{order}</b>\n"
+        f"Получателей: {len(recipients)} ({shown})\n"
         f"Язык: {', '.join(langs)}\n\n"
         f"<blockquote>{esc(broadcast['text'])}</blockquote>\n\n"
         "Отправить?",
@@ -135,7 +117,8 @@ async def keep_typing(bot: Bot, chat_id: int) -> None:
 @router.message(StateFilter(None), F.text, ~F.text.startswith("/"))
 async def ask_agent(message: Message, db: Database, bot: Bot, agent: ManagerAgent | None):
     if agent is None:
-        await message.answer("Агент выключен: задайте ANTHROPIC_API_KEY в .env и перезапустите бота.")
+        await message.answer("Агент выключен: задайте ANTHROPIC_API_KEY в .env и перезапустите бота.\n"
+                             "Без агента доступны /leads и /tasks.")
         return
     typing = asyncio.create_task(keep_typing(bot, message.chat.id))
     try:

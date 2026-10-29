@@ -1,5 +1,6 @@
-"""Сценарий заказчика: язык → категория → описание (+фото) → район → адрес → способ связи
-→ телефон → проверка → заявка уходит мастерам и менеджерам. Плюс /orders — свои заявки."""
+"""Вход в бота (/start → язык → «я мастер» или «мне нужен мастер») и сценарий заказчика:
+категория → описание (+фото) → район → адрес → способ связи → телефон → проверка →
+заявка уходит мастерам и менеджерам. Плюс /orders — свои заявки, /stop — без рассылок."""
 
 import logging
 
@@ -13,7 +14,8 @@ from ..config import Config
 from ..db import Database
 from ..texts import CATEGORIES, CONTACT_METHODS, DEFAULT_LANG, DISTRICTS, LANGS, t
 from . import keyboards as kb
-from .common import esc, normalize_phone, notify_managers, order_card, user_lang
+from ..phone import normalize_phone
+from .common import esc, notify_managers, order_card, user_lang
 
 log = logging.getLogger(__name__)
 router = Router(name="customer")
@@ -46,7 +48,25 @@ async def cmd_start(message: Message, state: FSMContext, db: Database):
         await message.answer(t(DEFAULT_LANG, "choose_language"), reply_markup=kb.language_kb())
         return
     await remember_user(db, message)
-    await message.answer(t(lang, "welcome"), reply_markup=kb.categories_kb(lang))
+    await message.answer(t(lang, "role_question"), reply_markup=kb.role_kb(lang))
+
+
+@router.callback_query(F.data == "role:customer")
+async def role_customer(callback: CallbackQuery, state: FSMContext, db: Database):
+    await state.clear()
+    lang = await user_lang(db, callback.from_user.id)
+    await callback.message.edit_text(t(lang, "welcome"), reply_markup=kb.categories_kb(lang))
+    await callback.answer()
+
+
+@router.message(Command("stop"))
+async def cmd_stop(message: Message, state: FSMContext, db: Database):
+    """Отказ от напоминаний и рассылок. Уведомления о своих заявках продолжают приходить."""
+    await state.clear()
+    lang = await user_lang(db, message.from_user.id)
+    await db.set_customer_consent(message.from_user.id, False)
+    await db.leads.set_consent(message.from_user.id, False)
+    await message.answer(t(lang, "stopped"))
 
 
 @router.message(Command("language"))
@@ -110,7 +130,7 @@ async def choose_language(callback: CallbackQuery, state: FSMContext, db: Databa
         return
     await state.clear()
     await remember_user(db, callback, lang)
-    await callback.message.edit_text(t(lang, "welcome"), reply_markup=kb.categories_kb(lang))
+    await callback.message.edit_text(t(lang, "role_question"), reply_markup=kb.role_kb(lang))
     await callback.answer()
 
 

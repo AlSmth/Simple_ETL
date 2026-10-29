@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -10,7 +11,7 @@ from ..agent import create_agent
 from ..config import load_config
 from ..db import Database
 from ..texts import DEFAULT_LANG, LANGS, t
-from . import customer, manager, master
+from . import crm, customer, followups, manager, master, onboarding
 from . import keyboards as kb
 from .common import user_lang
 
@@ -41,14 +42,15 @@ async def set_commands(bot: Bot, manager_ids: list[int]) -> None:
             BotCommand(command="orders", description=t(lang, "cmd_orders")),
             BotCommand(command="language", description=t(lang, "cmd_language")),
             BotCommand(command="cancel", description=t(lang, "cmd_cancel")),
+            BotCommand(command="stop", description=t(lang, "cmd_stop")),
         ]
 
     staff = [
-        BotCommand(command="help", description="Как работать с агентом"),
+        BotCommand(command="leads", description="Воронка мастеров"),
+        BotCommand(command="tasks", description="Кому написать сегодня"),
+        BotCommand(command="help", description="Как работать с ботом и агентом"),
         BotCommand(command="reset", description="Новый диалог с агентом"),
-        BotCommand(command="new", description="Свободные заявки (мастерам)"),
-        BotCommand(command="my", description="Мои заявки в работе (мастерам)"),
-        BotCommand(command="start", description="Новая заявка"),
+        BotCommand(command="start", description="Меню: мастер или заказчик"),
     ]
     try:
         await bot.set_my_commands(commands(DEFAULT_LANG))
@@ -81,12 +83,15 @@ async def main() -> None:
     # db, config и agent попадают в хендлеры как именованные аргументы
     dp = Dispatcher(storage=MemoryStorage(), db=db, config=config, agent=agent)
     # порядок важен: сценарии с состояниями раньше, чем «всё остальное»
-    dp.include_routers(customer.router, master.router, manager.router, fallback_router)
+    dp.include_routers(customer.router, onboarding.router, master.router, crm.router,
+                       manager.router, fallback_router)
 
     await set_commands(bot, config.manager_chat_ids)
     me = await bot.get_me()
     log.info("Бот запущен: @%s, агент %s", me.username, "включён" if agent else "выключен")
+    worker = asyncio.create_task(followups.run(bot, db, config))
     try:
         await dp.start_polling(bot)
     finally:
+        worker.cancel()
         await db.close()
